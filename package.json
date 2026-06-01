@@ -1,0 +1,16 @@
+{
+  "name": "worldcup-2026-api-proxy",
+  "version": "1.0.0",
+  "description": "API proxy for World Cup 2026 predictions app",
+  "main": "api.js",
+  "scripts": {
+    "start": "node api.js",
+    "dev": "node api.js"
+  },
+  "keywords": ["worldcup", "api", "proxy"],
+  "author": "Hugo",
+  "license": "MIT",
+  "engines": {
+    "node": "18.x"
+  }
+}
