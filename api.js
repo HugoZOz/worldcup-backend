@@ -2,11 +2,18 @@ const http = require('http');
 const https = require('https');
 const url = require('url');
 
-// Hugo's API Key (secure on server)
+// Hugo's API-Sports key (direct api-sports.io key, NOT a RapidAPI key)
 const API_KEY = 'dd34dfd25dc34b06a0e6b3b6ca39a9cd';
-const API_HOST = 'api-football-v1.p.rapidapi.com';
 
-// CORS headers
+// CORRECT host + header for a direct API-Sports account:
+//   host:   v3.football.api-sports.io
+//   header: x-apisports-key: <KEY>
+const API_HOST = 'v3.football.api-sports.io';
+
+// World Cup in API-Sports: league id 1, season 2026
+const WORLDCUP_LEAGUE = 1;
+const WORLDCUP_SEASON = 2026;
+
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -14,132 +21,119 @@ const corsHeaders = {
   'Content-Type': 'application/json'
 };
 
-// Create server
+// Helper: call API-Sports and return parsed JSON
+function callApiSports(apiPath, callback) {
+  const options = {
+    hostname: API_HOST,
+    port: 443,
+    path: apiPath,
+    method: 'GET',
+    headers: {
+      'x-apisports-key': API_KEY,
+      'Accept': 'application/json'
+    }
+  };
+
+  https.request(options, (apiRes) => {
+    let data = '';
+    apiRes.on('data', (chunk) => { data += chunk; });
+    apiRes.on('end', () => {
+      try {
+        callback(null, JSON.parse(data));
+      } catch (e) {
+        callback(new Error('Invalid JSON from API'), null);
+      }
+    });
+  }).on('error', (error) => {
+    callback(error, null);
+  }).end();
+}
+
 const server = http.createServer((req, res) => {
-  // Handle CORS preflight
   if (req.method === 'OPTIONS') {
     res.writeHead(200, corsHeaders);
     res.end();
     return;
   }
 
-  // Parse URL
   const parsedUrl = url.parse(req.url, true);
   const pathname = parsedUrl.pathname;
-  const query = parsedUrl.query;
 
-  // Logging
   console.log(`[${new Date().toISOString()}] ${req.method} ${pathname}`);
 
-  // Health check endpoint
-  if (pathname === '/health') {
-    res.writeHead(200, corsHeaders);
-    res.end(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }));
-    return;
-  }
-
-  // API proxy endpoint
-  if (pathname === '/api/check') {
-    // Check if API is working
-    const options = {
-      hostname: API_HOST,
-      port: 443,
-      path: '/v3/leagues?id=1',
-      method: 'GET',
-      headers: {
-        'X-RapidAPI-Key': API_KEY,
-        'X-RapidAPI-Host': API_HOST,
-        'User-Agent': 'WorldCup2026App'
+  // Health check - uses API-Sports /status (returns account info if key is valid)
+  if (pathname === '/api/check' || pathname === '/health') {
+    callApiSports('/status', (err, json) => {
+      if (err) {
+        res.writeHead(200, corsHeaders);
+        res.end(JSON.stringify({ status: 'offline', error: err.message }));
+        return;
       }
-    };
-
-    https.request(options, (apiRes) => {
-      let data = '';
-
-      apiRes.on('data', (chunk) => {
-        data += chunk;
-      });
-
-      apiRes.on('end', () => {
-        try {
-          const jsonData = JSON.parse(data);
-          res.writeHead(200, corsHeaders);
-          res.end(JSON.stringify({ 
-            status: 'online', 
-            api_response: jsonData,
-            timestamp: new Date().toISOString()
-          }));
-        } catch (e) {
-          res.writeHead(200, corsHeaders);
-          res.end(JSON.stringify({ 
-            status: 'online',
-            message: 'API is responding',
-            timestamp: new Date().toISOString()
-          }));
-        }
-      });
-    }).on('error', (error) => {
-      console.error('API Error:', error.message);
       res.writeHead(200, corsHeaders);
-      res.end(JSON.stringify({ 
-        status: 'offline',
-        error: error.message,
+      res.end(JSON.stringify({
+        status: 'online',
+        account: json.response || null,
+        errors: json.errors || null,
         timestamp: new Date().toISOString()
       }));
     });
-
     return;
   }
 
-  // Generic proxy for any API endpoint
-  if (pathname.startsWith('/api/')) {
-    const apiPath = pathname.replace('/api', '');
-    
-    const options = {
-      hostname: API_HOST,
-      port: 443,
-      path: `/v3${apiPath}${Object.keys(query).length > 0 ? '?' + Object.keys(query).map(k => `${k}=${query[k]}`).join('&') : ''}`,
-      method: 'GET',
-      headers: {
-        'X-RapidAPI-Key': API_KEY,
-        'X-RapidAPI-Host': API_HOST,
-        'User-Agent': 'WorldCup2026App'
-      }
-    };
-
-    console.log(`Proxying to: ${options.path}`);
-
-    https.request(options, (apiRes) => {
-      let data = '';
-
-      apiRes.on('data', (chunk) => {
-        data += chunk;
-      });
-
-      apiRes.on('end', () => {
+  // Fetch World Cup fixtures (all matches with scores/status)
+  if (pathname === '/api/fixtures') {
+    const apiPath = `/fixtures?league=${WORLDCUP_LEAGUE}&season=${WORLDCUP_SEASON}`;
+    callApiSports(apiPath, (err, json) => {
+      if (err) {
         res.writeHead(200, corsHeaders);
-        res.end(data);
-      });
-    }).on('error', (error) => {
-      console.error('Proxy Error:', error.message);
-      res.writeHead(500, corsHeaders);
-      res.end(JSON.stringify({ 
-        error: 'Proxy error',
-        message: error.message 
+        res.end(JSON.stringify({ status: 'error', error: err.message, matches: [] }));
+        return;
+      }
+
+      const matches = (json.response || []).map(item => ({
+        fixtureId: item.fixture.id,
+        date: item.fixture.date,
+        status: item.fixture.status.short,
+        home: item.teams.home.name,
+        away: item.teams.away.name,
+        homeGoals: item.goals.home,
+        awayGoals: item.goals.away
+      }));
+
+      res.writeHead(200, corsHeaders);
+      res.end(JSON.stringify({
+        status: 'ok',
+        count: matches.length,
+        errors: json.errors || null,
+        matches: matches,
+        timestamp: new Date().toISOString()
       }));
     });
-
     return;
   }
 
-  // 404
+  // Generic passthrough for any other API-Sports endpoint
+  if (pathname.startsWith('/api/')) {
+    const apiPath = pathname.replace('/api', '') + (parsedUrl.search || '');
+    callApiSports(apiPath, (err, json) => {
+      if (err) {
+        res.writeHead(500, corsHeaders);
+        res.end(JSON.stringify({ error: err.message }));
+        return;
+      }
+      res.writeHead(200, corsHeaders);
+      res.end(JSON.stringify(json));
+    });
+    return;
+  }
+
   res.writeHead(404, corsHeaders);
   res.end(JSON.stringify({ error: 'Endpoint not found' }));
 });
 
-// Start server
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🚀 World Cup 2026 API Proxy running on port ${PORT}`);
-  console.log(`API Key: ${API_KEY.substring(0, 8)}...`);
+  console.log(`World Cup 2026 API proxy running on port ${PORT}`);
 });
+
+module.exports = server;
