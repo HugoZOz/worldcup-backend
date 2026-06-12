@@ -1,119 +1,135 @@
 const https = require('https');
 const url = require('url');
 
-// Hugo's API-Sports key (direct api-sports.io key, NOT a RapidAPI key)
 const API_KEY = 'dd34dfd25dc34b06a0e6b3b6ca39a9cd';
-const API_HOST = 'v3.football.api-sports.io';
 
-// World Cup in API-Sports: league id 1, season 2026
+// Two possible providers - we test both to find which one the key belongs to
+const PROVIDERS = {
+  apisports: {
+    host: 'v3.football.api-sports.io',
+    header: 'x-apisports-key'
+  },
+  rapidapi: {
+    host: 'api-football-v1.p.rapidapi.com',
+    header: 'x-rapidapi-key',
+    extraHeader: { 'x-rapidapi-host': 'api-football-v1.p.rapidapi.com' }
+  }
+};
+
 const WORLDCUP_LEAGUE = 1;
 const WORLDCUP_SEASON = 2026;
 
-// Call API-Sports and return parsed JSON via callback
-function callApiSports(apiPath, callback) {
-  const options = {
-    hostname: API_HOST,
-    port: 443,
-    path: apiPath,
-    method: 'GET',
-    headers: {
-      'x-apisports-key': API_KEY,
-      'Accept': 'application/json'
-    }
-  };
+function call(provider, apiPath, callback) {
+  const p = PROVIDERS[provider];
+  const headers = { 'Accept': 'application/json' };
+  headers[p.header] = API_KEY;
+  if (p.extraHeader) Object.assign(headers, p.extraHeader);
+
+  // RapidAPI prefixes paths with /v3
+  const fullPath = (provider === 'rapidapi' ? '/v3' : '') + apiPath;
+
+  const options = { hostname: p.host, port: 443, path: fullPath, method: 'GET', headers };
 
   https.request(options, (apiRes) => {
     let data = '';
     apiRes.on('data', (chunk) => { data += chunk; });
     apiRes.on('end', () => {
-      try {
-        callback(null, JSON.parse(data));
-      } catch (e) {
-        callback(new Error('Invalid JSON from API'), null);
-      }
+      try { callback(null, JSON.parse(data)); }
+      catch (e) { callback(new Error('Invalid JSON'), null); }
     });
-  }).on('error', (error) => {
-    callback(error, null);
-  }).end();
+  }).on('error', (error) => { callback(error, null); }).end();
 }
 
-// Vercel serverless handler
+function hasError(json) {
+  if (!json) return true;
+  if (Array.isArray(json.errors)) return json.errors.length > 0;
+  if (json.errors && typeof json.errors === 'object') return Object.keys(json.errors).length > 0;
+  return false;
+}
+
+// Detect which provider the key works with, then run the callback with that provider
+function detectProvider(callback) {
+  call('apisports', '/status', (err, json) => {
+    if (!err && !hasError(json) && json.response) {
+      callback('apisports');
+    } else {
+      call('rapidapi', '/status', (err2, json2) => {
+        if (!err2 && !hasError(json2) && json2.response) {
+          callback('rapidapi');
+        } else {
+          callback(null);
+        }
+      });
+    }
+  });
+}
+
 module.exports = (req, res) => {
-  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Content-Type', 'application/json');
 
-  if (req.method === 'OPTIONS') {
-    res.statusCode = 200;
-    res.end();
-    return;
-  }
+  if (req.method === 'OPTIONS') { res.statusCode = 200; res.end(); return; }
 
   const parsedUrl = url.parse(req.url, true);
   const pathname = parsedUrl.pathname;
 
-  // Health check
+  // Diagnostic: tells you which provider your key belongs to
   if (pathname === '/api/check' || pathname === '/health' || pathname === '/') {
-    callApiSports('/status', (err, json) => {
-      if (err) {
+    call('apisports', '/status', (e1, j1) => {
+      const apisportsOk = !e1 && !hasError(j1) && !!(j1 && j1.response);
+      call('rapidapi', '/status', (e2, j2) => {
+        const rapidapiOk = !e2 && !hasError(j2) && !!(j2 && j2.response);
+        let working = apisportsOk ? 'apisports' : (rapidapiOk ? 'rapidapi' : 'none');
         res.statusCode = 200;
-        res.end(JSON.stringify({ status: 'offline', error: err.message }));
-        return;
-      }
-      res.statusCode = 200;
-      res.end(JSON.stringify({
-        status: 'online',
-        account: json.response || null,
-        errors: json.errors || null,
-        timestamp: new Date().toISOString()
-      }));
+        res.end(JSON.stringify({
+          working_provider: working,
+          apisports_ok: apisportsOk,
+          rapidapi_ok: rapidapiOk,
+          apisports_response: apisportsOk ? j1.response : (j1 ? j1.errors : null),
+          rapidapi_response: rapidapiOk ? j2.response : (j2 ? j2.errors : null),
+          timestamp: new Date().toISOString()
+        }));
+      });
     });
     return;
   }
 
-  // World Cup fixtures
+  // Fixtures - auto-detects the right provider first
   if (pathname === '/api/fixtures') {
-    const apiPath = `/fixtures?league=${WORLDCUP_LEAGUE}&season=${WORLDCUP_SEASON}`;
-    callApiSports(apiPath, (err, json) => {
-      if (err) {
+    detectProvider((provider) => {
+      if (!provider) {
         res.statusCode = 200;
-        res.end(JSON.stringify({ status: 'error', error: err.message, matches: [] }));
+        res.end(JSON.stringify({ status: 'error', error: 'No working provider for this key', matches: [] }));
         return;
       }
-      const matches = (json.response || []).map(item => ({
-        fixtureId: item.fixture.id,
-        date: item.fixture.date,
-        status: item.fixture.status.short,
-        home: item.teams.home.name,
-        away: item.teams.away.name,
-        homeGoals: item.goals.home,
-        awayGoals: item.goals.away
-      }));
-      res.statusCode = 200;
-      res.end(JSON.stringify({
-        status: 'ok',
-        count: matches.length,
-        errors: json.errors || null,
-        matches: matches,
-        timestamp: new Date().toISOString()
-      }));
-    });
-    return;
-  }
-
-  // Generic passthrough
-  if (pathname.startsWith('/api/')) {
-    const apiPath = pathname.replace('/api', '') + (parsedUrl.search || '');
-    callApiSports(apiPath, (err, json) => {
-      if (err) {
-        res.statusCode = 500;
-        res.end(JSON.stringify({ error: err.message }));
-        return;
-      }
-      res.statusCode = 200;
-      res.end(JSON.stringify(json));
+      const apiPath = `/fixtures?league=${WORLDCUP_LEAGUE}&season=${WORLDCUP_SEASON}`;
+      call(provider, apiPath, (err, json) => {
+        if (err) {
+          res.statusCode = 200;
+          res.end(JSON.stringify({ status: 'error', error: err.message, matches: [] }));
+          return;
+        }
+        const matches = (json.response || []).map(item => ({
+          fixtureId: item.fixture.id,
+          date: item.fixture.date,
+          status: item.fixture.status.short,
+          home: item.teams.home.name,
+          away: item.teams.away.name,
+          homeGoals: item.goals.home,
+          awayGoals: item.goals.away
+        }));
+        res.statusCode = 200;
+        res.end(JSON.stringify({
+          status: 'ok',
+          provider: provider,
+          count: matches.length,
+          errors: json.errors || null,
+          matches: matches,
+          timestamp: new Date().toISOString()
+        }));
+      });
     });
     return;
   }
