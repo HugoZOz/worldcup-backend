@@ -1,7 +1,7 @@
 const https = require('https');
 const url = require('url');
 
-const API_KEY = 'dd34dfd25dc34b06a0e6b3b6ca39a9cd';
+const API_KEY = '4c34fc6ca90b3bdd81d843f465bd6492';
 
 // Two possible providers - we test both to find which one the key belongs to
 const PROVIDERS = {
